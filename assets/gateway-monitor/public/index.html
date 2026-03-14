@@ -390,6 +390,7 @@
       </div>
       <button onclick="copyRecoverCmd()">复制恢复命令</button>
       <button onclick="copyDiagnostics()">复制诊断</button>
+      <button id="restartGatewayBtn" onclick="restartGateway()" style="background-color: #f59e0b; color: white; border-color: #d97706;">重启 Gateway</button>
       <button onclick="restoreConfig()" style="background-color: #ef4444; color: white; border-color: #dc2626;">紧急还原配置</button>
     </div>
   </header>
@@ -535,6 +536,8 @@
       <div class="ph-act">
         <button onclick="reloadMiniMax(true)">刷新 MiniMax</button>
         <button onclick="reloadOmlx(true)">刷新 oMLX</button>
+        <button id="checkOmlxUpdateBtn" onclick="checkOmlxUpdate(true)">检查 oMLX 更新</button>
+        <button onclick="setOmlxRepo()">设置 oMLX 仓库</button>
       </div>
     </div>
     <div class="models-grid">
@@ -576,6 +579,8 @@
             <div class="mm-lbl">oMLX 版本</div>
             <div class="mm-val c-ok" id="omlxVersionValue">-</div>
             <div class="mm-meta" id="omlxVersionMeta">等待检测...</div>
+            <div class="mm-meta" id="omlxUpdateMeta">点击“检查 oMLX 更新”获取 GitHub 最新版本</div>
+            <div class="mm-meta" id="omlxRepoMeta">repo: jundot/omlx</div>
           </div>
           <div>
             <div class="mm-lbl">可用模态</div>
@@ -624,6 +629,7 @@
         <button id="onlyIssuesBtn" onclick="toggleOnlyIssues()">仅看异常</button>
         <button onclick="reloadLogs()">筛选</button>
         <button onclick="resetFilter()">重置</button>
+        <button id="clearLogsBtn" onclick="toggleClearCurrentLogs()">清除当前日志</button>
         <button onclick="exportLogs()">导出 JSON</button>
       </div>
     </div>
@@ -633,6 +639,7 @@
         <span class="pager-info" id="logPageInfo">第 1 页 / 共 1 页</span>
         <button onclick="nextLogPage()">下一页</button>
       </div>
+      <span class="pager-info" id="logCutoffMeta">基线: 全部日志</span>
       <label class="pager-info">每页
         <select id="logPageSize" onchange="setLogPageSize(this.value)">
           <option value="20">20</option>
@@ -667,8 +674,13 @@ const state = {
   latestAgents: null,
   latestMiniMax: null,
   latestOmlx: null,
+  latestOmlxUpdate: null,
+  checkingOmlxUpdate: false,
   latestLogs: [],
+  latestLogsRaw: [],
   latestLogsAll: [],
+  logsCutoffTs: null,
+  restartingGateway: false,
   logPage: 1,
   logPageSize: 50,
   onlyIssues: false,
@@ -743,8 +755,8 @@ function minimaxHealthLvl(pct) {
   return 'bad';
 }
 
-async function getJSON(url) {
-  const r = await fetch(url, { cache:'no-store' });
+async function getJSON(url, options = {}) {
+  const r = await fetch(url, { cache:'no-store', ...options });
   if (!r.ok) throw new Error(`${url} -> ${r.status}`);
   return r.json();
 }
@@ -828,6 +840,38 @@ function resetFilter() {
   updateOnlyIssuesUI();
   state.logPage = 1;
   reloadLogs().catch(console.error);
+}
+
+function applyLogCutoff() {
+  const raw = Array.isArray(state.latestLogsRaw) ? state.latestLogsRaw : [];
+  const cutoff = Number(state.logsCutoffTs) || 0;
+  state.latestLogsAll = cutoff
+    ? raw.filter((e) => Number(e?.ts || 0) >= cutoff)
+    : raw.slice();
+}
+
+function updateLogCutoffUI() {
+  const btn = byId('clearLogsBtn');
+  const cutoff = Number(state.logsCutoffTs) || 0;
+  if (btn) {
+    btn.classList.toggle('btn-active', cutoff > 0);
+    btn.textContent = cutoff > 0 ? '恢复全部日志' : '清除当前日志';
+  }
+  setText('logCutoffMeta', cutoff > 0
+    ? `基线: ${new Date(cutoff).toLocaleString()} 之后`
+    : '基线: 全部日志');
+}
+
+function toggleClearCurrentLogs() {
+  if (state.logsCutoffTs) {
+    state.logsCutoffTs = null;
+  } else {
+    state.logsCutoffTs = Date.now();
+  }
+  state.logPage = 1;
+  applyLogCutoff();
+  updateLogCutoffUI();
+  renderCurrentLogPage(curFilters().keyword || '');
 }
 
 function updateOnlyIssuesUI() {
@@ -996,7 +1040,7 @@ function renderMiniMax(payload) {
   const lvl = minimaxHealthLvl(usagePct);
   const lvlCls = lvl==='bad'?'c-err':(lvl==='warn'?'c-warn':'c-ok');
 
-  setText('mmStatusText', `${payload?.statusMsg||'-'} · key=${payload?.keyMasked||'-'}`);
+  setText('mmStatusText', `${payload?.statusMsg||'-'}`);
   setText('miniStatusMeta', payload?.error
     ? `error: ${payload.error}`
     : `source=${payload?.source||'-'} | status=${payload?.statusMsg||'-'}`);
@@ -1044,7 +1088,7 @@ function renderOmlx(payload) {
   const models = Array.isArray(payload?.models) ? payload.models : [];
   const modalities = Array.isArray(payload?.modalities) ? payload.modalities : [];
   const installedTypes = Array.isArray(payload?.installedModelTypes) ? payload.installedModelTypes : [];
-  setText('omlxStatusText', `${payload?.statusMsg || '-'} · key=${payload?.keyMasked || '-'}`);
+  setText('omlxStatusText', `${payload?.statusMsg || '-'}`);
   setText('omlxModelCount', Number.isFinite(Number(payload?.count)) ? payload.count : models.length);
   setText('omlxStatusMeta', payload?.error
     ? `error: ${payload.error}`
@@ -1088,6 +1132,104 @@ async function reloadOmlx(force=false) {
     throw err;
   } finally {
     renderAuditPanel();
+  }
+}
+
+function updateCheckOmlxBtn() {
+  const btn = byId('checkOmlxUpdateBtn');
+  if (!btn) return;
+  btn.disabled = !!state.checkingOmlxUpdate;
+  btn.textContent = state.checkingOmlxUpdate ? '检查中...' : '检查 oMLX 更新';
+}
+
+function readOmlxRepo() {
+  const key = 'gatewayMonitor.omlxGithubRepo';
+  try {
+    const v = localStorage.getItem(key);
+    const s = String(v || '').trim();
+    return s || 'jundot/omlx';
+  } catch {
+    return 'jundot/omlx';
+  }
+}
+
+function writeOmlxRepo(repo) {
+  const key = 'gatewayMonitor.omlxGithubRepo';
+  try {
+    localStorage.setItem(key, repo);
+  } catch {
+    // ignore
+  }
+}
+
+function updateOmlxRepoMeta() {
+  setText('omlxRepoMeta', `repo: ${readOmlxRepo()}`);
+}
+
+function setOmlxRepo() {
+  const current = readOmlxRepo();
+  const next = prompt('输入 GitHub 仓库（owner/repo）', current);
+  if (next === null) return;
+  const repo = String(next || '').trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    alert('仓库格式无效，请使用 owner/repo');
+    return;
+  }
+  writeOmlxRepo(repo);
+  updateOmlxRepoMeta();
+  setText('omlxUpdateMeta', '仓库已更新，点击“检查 oMLX 更新”开始检测');
+}
+
+function renderOmlxUpdate(payload) {
+  state.latestOmlxUpdate = payload || null;
+  if (!payload) {
+    setText('omlxUpdateMeta', '点击“检查 oMLX 更新”获取 GitHub 最新版本');
+    return;
+  }
+  if (!payload.ok) {
+    setText('omlxUpdateMeta', `更新检查失败: ${payload.error || payload.statusMsg || 'unknown'}`);
+    return;
+  }
+
+  const current = payload.currentVersion || state.latestOmlx?.version || '-';
+  const latest = payload.latestVersion || '-';
+  const releaseAt = payload.publishedAt ? new Date(payload.publishedAt).toLocaleString() : '-';
+  const releaseUrl = payload.releaseUrl || '-';
+
+  if (payload.updateAvailable === true) {
+    setText('omlxUpdateMeta', `发现新版本: ${current} -> ${latest} | 发布: ${releaseAt} | ${releaseUrl}`);
+    return;
+  }
+  if (payload.updateAvailable === false) {
+    setText('omlxUpdateMeta', `已是最新版本: ${current} | 最新发布: ${latest} | ${releaseAt}`);
+    return;
+  }
+  setText('omlxUpdateMeta', `已获取最新发布: ${latest} | 当前: ${current} | 无法自动比较版本`);
+}
+
+async function checkOmlxUpdate(force=false) {
+  if (state.checkingOmlxUpdate) return;
+  state.checkingOmlxUpdate = true;
+  updateCheckOmlxBtn();
+  try {
+    const localVersion = String(state.latestOmlx?.version || '').trim();
+    const repo = readOmlxRepo();
+    const query = new URLSearchParams({
+      ...(force ? { force: '1' } : {}),
+      ...(repo ? { repo } : {}),
+      ...(localVersion ? { localVersion } : {})
+    });
+    const url = `/api/omlx-update-check${query.toString() ? `?${query.toString()}` : ''}`;
+    const data = await getJSON(url);
+    renderOmlxUpdate(data);
+  } catch (err) {
+    renderOmlxUpdate({
+      ok: false,
+      error: err?.message || String(err)
+    });
+  } finally {
+    state.checkingOmlxUpdate = false;
+    updateCheckOmlxBtn();
   }
 }
 
@@ -1292,7 +1434,8 @@ async function reloadLogs() {
   try {
     const data = await getJSON('/api/logs?'+new URLSearchParams(f).toString());
     setAuditSource('logs', { ok: true, statusMsg: `count=${data.count ?? (data.items||[]).length}` });
-    state.latestLogsAll = Array.isArray(data.items) ? data.items : [];
+    state.latestLogsRaw = Array.isArray(data.items) ? data.items : [];
+    applyLogCutoff();
     renderCurrentLogPage(f.keyword || '');
   } catch (err) {
     setAuditSourceError('logs', err);
@@ -1355,6 +1498,38 @@ async function restoreConfig() {
     }
   } catch(err) {
     alert(`❌ 请求失败: ${err.message}`);
+  }
+}
+
+function updateRestartGatewayBtn() {
+  const btn = byId('restartGatewayBtn');
+  if (!btn) return;
+  btn.disabled = !!state.restartingGateway;
+  btn.textContent = state.restartingGateway ? '重启中...' : '重启 Gateway';
+}
+
+async function restartGateway() {
+  if (state.restartingGateway) return;
+  if (!confirm('确认重启 OpenClaw Gateway？此操作会短暂中断请求。')) return;
+
+  state.restartingGateway = true;
+  updateRestartGatewayBtn();
+  try {
+    const result = await getJSON('/api/gateway-restart?confirm=true');
+    if (!result.ok) {
+      throw new Error(result?.stderr || result?.message || 'restart failed');
+    }
+    alert('✅ Gateway 重启成功');
+    await Promise.all([
+      reloadSummary().catch(console.error),
+      reloadLaunchd().catch(console.error),
+      reloadLogs().catch(console.error)
+    ]);
+  } catch (err) {
+    alert(`❌ Gateway 重启失败: ${err.message}`);
+  } finally {
+    state.restartingGateway = false;
+    updateRestartGatewayBtn();
   }
 }
 function exportLogs() {
@@ -1429,7 +1604,8 @@ async function bootstrap() {
     if (boot.summary) renderSummary(boot.summary);
     if (boot.agents) renderAgentStatus(boot.agents);
     if (boot.logs?.items) {
-      state.latestLogsAll = boot.logs.items;
+      state.latestLogsRaw = Array.isArray(boot.logs.items) ? boot.logs.items : [];
+      applyLogCutoff();
       renderCurrentLogPage(curFilters().keyword||'');
     }
   } catch(e) { console.error(e); }
@@ -1456,6 +1632,10 @@ document.addEventListener('keydown', e => {
 bootstrap().catch(console.error);
 bindLogsScrollHint();
 updateAutoRefreshUI();
+updateRestartGatewayBtn();
+updateCheckOmlxBtn();
+updateOmlxRepoMeta();
+updateLogCutoffUI();
 startAutoRefreshCycle();
 </script>
 </body>

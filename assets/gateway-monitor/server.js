@@ -8,7 +8,7 @@ const { execSync } = require('child_process');
 const url = require('url');
 
 const PORT = Number(process.env.PORT || 18990);
-const HOME = process.env.HOME || '/Users/bakeyzhang';
+const HOME = process.env.HOME || os.homedir() || '/tmp';
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const MAX_WINDOW_MS = 6 * ONE_HOUR_MS;
 const MIN_WINDOW_MS = 5 * 60 * 1000;
@@ -23,6 +23,7 @@ const LOG_READ_MAX_ENTRIES = clampNumber(process.env.LOG_READ_MAX_ENTRIES, 350, 
 
 const OPENCLAW_STATUS_CMD = process.env.OPENCLAW_STATUS_CMD || '/opt/homebrew/opt/node/bin/node /opt/homebrew/lib/node_modules/openclaw/dist/index.js gateway status --json';
 const OPENCLAW_FULL_STATUS_CMD = process.env.OPENCLAW_FULL_STATUS_CMD || '/opt/homebrew/opt/node/bin/node /opt/homebrew/lib/node_modules/openclaw/dist/index.js status --json';
+const OPENCLAW_RESTART_CMD = process.env.OPENCLAW_RESTART_CMD || '/opt/homebrew/opt/node/bin/node /opt/homebrew/lib/node_modules/openclaw/dist/index.js gateway restart';
 const USER_UID = process.getuid ? process.getuid() : Number(execSync('id -u', { encoding: 'utf8' }).trim());
 
 const MINIMAX_REMAINS_URL = process.env.MINIMAX_REMAINS_URL || 'https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains';
@@ -32,6 +33,8 @@ const OMLX_MODELS_URL = process.env.OMLX_MODELS_URL || 'http://127.0.0.1:9981/v1
 const OMLX_API_KEY = String(process.env.OMLX_API_KEY || '8888').trim();
 const OMLX_CACHE_TTL_MS = clampNumber(process.env.OMLX_CACHE_TTL_MS, 12000, 3000, 120000);
 const OMLX_OPENAPI_URL = process.env.OMLX_OPENAPI_URL || `${baseUrlFromEndpoint(OMLX_MODELS_URL)}/openapi.json`;
+const OMLX_GITHUB_REPO = String(process.env.OMLX_GITHUB_REPO || 'jundot/omlx').trim();
+const OMLX_UPDATE_CACHE_TTL_MS = clampNumber(process.env.OMLX_UPDATE_CACHE_TTL_MS, 10 * 60 * 1000, 10000, 60 * 60 * 1000);
 
 const entryCache = new Map();
 const sseClients = new Set();
@@ -50,6 +53,7 @@ const omlxCapabilitiesCache = {
   value: null,
   inFlight: null
 };
+const omlxUpdateCacheMap = new Map();
 
 // Session usage tracking for velocity + history
 const sessionTracker = {
@@ -448,6 +452,153 @@ function detectOmlxModalities(paths) {
   return out;
 }
 
+function normalizeVersionString(v) {
+  return String(v || '')
+    .trim()
+    .replace(/^[vV]/, '')
+    .split('+')[0]
+    .trim();
+}
+
+function parseVersionTriplet(v) {
+  const n = normalizeVersionString(v);
+  if (!n) return null;
+  const main = n.split('-')[0];
+  const parts = main.split('.').map((x) => Number(x));
+  if (!parts.length || parts.some((x) => !Number.isFinite(x) || x < 0)) return null;
+  if (parts.length === 1) return [parts[0], 0, 0];
+  if (parts.length === 2) return [parts[0], parts[1], 0];
+  return [parts[0], parts[1], parts[2]];
+}
+
+function compareVersions(a, b) {
+  const av = parseVersionTriplet(a);
+  const bv = parseVersionTriplet(b);
+  if (!av || !bv) return null;
+  for (let i = 0; i < 3; i++) {
+    if (av[i] > bv[i]) return 1;
+    if (av[i] < bv[i]) return -1;
+  }
+  return 0;
+}
+
+function normalizeGithubRepo(input) {
+  const s = String(input || '').trim();
+  if (!s) return OMLX_GITHUB_REPO;
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(s)) return OMLX_GITHUB_REPO;
+  return s;
+}
+
+async function loadOmlxUpdateInfo(force = false, currentVersion = '', repoInput = OMLX_GITHUB_REPO) {
+  const repo = normalizeGithubRepo(repoInput);
+  const releaseApi = `https://api.github.com/repos/${repo}/releases/latest`;
+  const tagsApi = `https://api.github.com/repos/${repo}/tags?per_page=1`;
+  const cacheKey = repo.toLowerCase();
+  const cacheBucket = omlxUpdateCacheMap.get(cacheKey) || { at: 0, value: null, inFlight: null };
+  omlxUpdateCacheMap.set(cacheKey, cacheBucket);
+
+  const now = Date.now();
+  if (!force && cacheBucket.value && now - cacheBucket.at < OMLX_UPDATE_CACHE_TTL_MS) {
+    const cached = cacheBucket.value;
+    return {
+      ...cached,
+      currentVersion: currentVersion || cached.currentVersion || null,
+      comparison: currentVersion ? compareVersions(currentVersion, cached.latestVersion) : cached.comparison,
+      updateAvailable: currentVersion
+        ? compareVersions(currentVersion, cached.latestVersion) === -1
+        : cached.updateAvailable
+    };
+  }
+  if (!force && cacheBucket.inFlight) {
+    return cacheBucket.inFlight;
+  }
+
+  cacheBucket.inFlight = (async () => {
+    const basePayload = {
+      now: new Date().toISOString(),
+      ok: false,
+      source: 'github-release',
+      repo,
+      api: releaseApi,
+      tagsApi,
+      currentVersion: currentVersion || null,
+      latestVersion: null,
+      releaseName: null,
+      releaseUrl: null,
+      publishedAt: null,
+      comparison: null,
+      updateAvailable: null,
+      statusMsg: 'request_failed'
+    };
+
+    try {
+      let source = 'github-release';
+      let payload = null;
+      let latestVersion = null;
+      let releaseName = null;
+      let releaseUrl = null;
+      let publishedAt = null;
+
+      try {
+        payload = await fetchJson(releaseApi, {
+          Accept: 'application/vnd.github+json',
+          'User-Agent': 'gateway-monitor'
+        }, 4500);
+        latestVersion = String(payload?.tag_name || payload?.name || '').trim() || null;
+        releaseName = String(payload?.name || '').trim() || null;
+        releaseUrl = String(payload?.html_url || '').trim() || null;
+        publishedAt = String(payload?.published_at || '').trim() || null;
+      } catch (releaseErr) {
+        // Some repositories don't publish GitHub releases, fallback to latest tag.
+        const tagPayload = await fetchJson(tagsApi, {
+          Accept: 'application/vnd.github+json',
+          'User-Agent': 'gateway-monitor'
+        }, 4500);
+        const firstTag = Array.isArray(tagPayload) ? tagPayload[0] : null;
+        source = 'github-tags';
+        latestVersion = String(firstTag?.name || '').trim() || null;
+        releaseName = latestVersion;
+        releaseUrl = String(firstTag?.zipball_url || firstTag?.tarball_url || '').trim() || null;
+        publishedAt = null;
+        if (!latestVersion) {
+          throw releaseErr;
+        }
+      }
+
+      const cmp = latestVersion && currentVersion ? compareVersions(currentVersion, latestVersion) : null;
+      const result = {
+        ...basePayload,
+        source,
+        ok: true,
+        statusMsg: 'success',
+        latestVersion,
+        releaseName,
+        releaseUrl,
+        publishedAt,
+        comparison: cmp,
+        updateAvailable: cmp === -1 ? true : (cmp === 0 ? false : null)
+      };
+      cacheBucket.value = result;
+      cacheBucket.at = Date.now();
+      return result;
+    } catch (err) {
+      const result = {
+        ...basePayload,
+        error: String(err?.message || err)
+      };
+      cacheBucket.value = result;
+      cacheBucket.at = Date.now();
+      return result;
+    }
+  })();
+
+  try {
+    return await cacheBucket.inFlight;
+  } finally {
+    cacheBucket.inFlight = null;
+  }
+}
+
 async function loadOmlxCapabilities(force = false) {
   const now = Date.now();
   if (!force && omlxCapabilitiesCache.value && now - omlxCapabilitiesCache.at < OMLX_CACHE_TTL_MS) {
@@ -520,7 +671,6 @@ async function loadOmlxModels(force = false) {
       source: 'omlx',
       baseUrl: OMLX_MODELS_URL,
       openapiUrl: OMLX_OPENAPI_URL,
-      keyMasked: maskKey(OMLX_API_KEY),
       count: 0,
       version: null,
       modalities: [],
@@ -648,7 +798,6 @@ async function loadMiniMaxCodingPlan(force = false) {
       now: new Date().toISOString(),
       ok: false,
       statusMsg: 'unavailable',
-      keyMasked: maskKey(keyInfo.key),
       source: keyInfo.source,
       windowHours: 5,
       models: []
@@ -1328,6 +1477,30 @@ function json(res, obj, code = 200) {
   res.end(body);
 }
 
+function runCommandDetailed(command, timeout = 15000) {
+  try {
+    const stdout = execSync(command, {
+      encoding: 'utf8',
+      timeout,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    return {
+      ok: true,
+      stdout: String(stdout || '').trim(),
+      stderr: ''
+    };
+  } catch (err) {
+    const stdout = err?.stdout ? String(err.stdout) : '';
+    const stderr = err?.stderr ? String(err.stderr) : '';
+    return {
+      ok: false,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      message: String(err?.message || err)
+    };
+  }
+}
+
 let indexHtmlCache = null;
 function serveIndex(res) {
   if (!indexHtmlCache) {
@@ -1489,7 +1662,6 @@ const server = http.createServer((req, res) => {
         now: new Date().toISOString(),
         ok: false,
         statusMsg: 'request_failed',
-        keyMasked: null,
         source: null,
         windowHours: 5,
         models: [],
@@ -1508,7 +1680,6 @@ const server = http.createServer((req, res) => {
         statusMsg: 'request_failed',
         source: 'omlx',
         baseUrl: OMLX_MODELS_URL,
-        keyMasked: maskKey(OMLX_API_KEY),
         count: 0,
         models: [],
         error: String(err?.message || err)
@@ -1529,6 +1700,27 @@ const server = http.createServer((req, res) => {
         version: null,
         modalities: [],
         paths: [],
+        error: String(err?.message || err)
+      }, 500));
+    return;
+  }
+
+  if (pathname === '/api/omlx-update-check') {
+    const force = String(parsed.query.force || '').trim() === '1';
+    const localVersion = String(parsed.query.localVersion || '').trim();
+    const repo = normalizeGithubRepo(String(parsed.query.repo || OMLX_GITHUB_REPO));
+    const currentVersion = localVersion || String(getCachedOmlxModels()?.version || '').trim();
+    loadOmlxUpdateInfo(force, currentVersion, repo)
+      .then((payload) => json(res, payload))
+      .catch((err) => json(res, {
+        now: new Date().toISOString(),
+        ok: false,
+        source: 'github-release',
+        repo,
+        api: `https://api.github.com/repos/${repo}/releases/latest`,
+        tagsApi: `https://api.github.com/repos/${repo}/tags?per_page=1`,
+        currentVersion: currentVersion || null,
+        statusMsg: 'request_failed',
         error: String(err?.message || err)
       }, 500));
     return;
@@ -1675,6 +1867,40 @@ const server = http.createServer((req, res) => {
         stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
       }, 500);
     }
+  }
+
+  if (pathname === '/api/gateway-restart') {
+    if (req.method !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Method not allowed', allowed: ['GET'] }));
+    }
+
+    const confirm = String(parsed.query.confirm || '').trim();
+    if (confirm !== 'true') {
+      return json(res, {
+        ok: false,
+        error: 'Confirmation required',
+        message: 'Add ?confirm=true to confirm gateway restart'
+      }, 400);
+    }
+
+    const before = gatewayStatus();
+    const execResult = runCommandDetailed(OPENCLAW_RESTART_CMD, 25000);
+    const after = gatewayStatus();
+    const success = execResult.ok && after.runtimeStatus === 'running' && after.loaded === true;
+
+    return json(res, {
+      ok: success,
+      before,
+      after,
+      command: 'openclaw gateway restart',
+      now: new Date().toISOString(),
+      message: success
+        ? 'Gateway restarted successfully.'
+        : 'Gateway restart command finished, but runtime status is not healthy.',
+      stdout: execResult.stdout,
+      stderr: execResult.stderr || execResult.message || ''
+    }, success ? 200 : 500);
   }
 
   res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
